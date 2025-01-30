@@ -39,6 +39,10 @@
 #define SEND_BUFFER_SIZE (16 * 1024 * 1024)
 #define RECV_BUFFER_SIZE (31 * 1024 * 1024)
 
+static bool no_mask = false;
+module_param(no_mask, bool, 0644);
+MODULE_PARM_DESC(no_mask, "do not manipulate the interrupt mask flag from kernel mode");
+
 /*
  * List of resources to be mapped to user space
  * can be extended up to MAX_UIO_MAPS(5) items
@@ -67,7 +71,8 @@ struct hv_uio_private_data {
 
 static void set_event(struct vmbus_channel *channel, s32 irq_state)
 {
-	channel->inbound.ring_buffer->interrupt_mask = !irq_state;
+	if (!no_mask)	
+		channel->inbound.ring_buffer->interrupt_mask = !irq_state;
 	if (!channel->offermsg.monitor_allocated && irq_state) {
 		/* MB is needed for host to see the interrupt mask first */
 		virt_mb();
