@@ -65,6 +65,9 @@ SYM_FUNC_START(__mshv_vtl_return_call)
 	mov 16(%rsp), %rcx
 	mov 24(%rsp), %rax
 
+	mov %rdx, MSHV_VTL_CPU_CONTEXT_rdx(%rax)
+	mov %cr2, %rdx
+	mov %rdx, MSHV_VTL_CPU_CONTEXT_cr2(%rax)
 	pop MSHV_VTL_CPU_CONTEXT_rcx(%rax)
 	pop MSHV_VTL_CPU_CONTEXT_rax(%rax)
 	add $16, %rsp

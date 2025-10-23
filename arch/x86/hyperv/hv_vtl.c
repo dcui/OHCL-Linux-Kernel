@@ -258,9 +258,9 @@ DEFINE_STATIC_CALL_NULL(__mshv_vtl_return_hypercall, void (*)(void));
 
 noinstr void mshv_vtl_return_hypercall(void)
 {
-	asm volatile ("call " STATIC_CALL_TRAMP_STR(__mshv_vtl_return_hypercall) :
-		      ASM_CALL_CONSTRAINT);
+	asm volatile ("call " STATIC_CALL_TRAMP_STR(__mshv_vtl_return_hypercall));
 }
+STACK_FRAME_NON_STANDARD_FP(mshv_vtl_return_hypercall);
 
 extern void __mshv_vtl_return_call(struct mshv_vtl_cpu_context *vtl0);
 
