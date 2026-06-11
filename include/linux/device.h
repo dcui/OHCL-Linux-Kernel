@@ -738,6 +738,7 @@ struct device {
 #ifdef CONFIG_IOMMU_DMA
 	bool			dma_iommu:1;
 #endif
+	bool			use_priv_pages_for_io:1;
 
 	DECLARE_BITMAP(flags, DEV_FLAG_COUNT);
 };
@@ -1100,6 +1101,11 @@ static inline bool dev_is_removable(struct device *dev)
 static inline bool dev_removable_is_valid(struct device *dev)
 {
 	return dev->removable != DEVICE_REMOVABLE_NOT_SUPPORTED;
+}
+
+static inline bool dev_priv_pages_for_io(struct device *dev)
+{
+	return dev->use_priv_pages_for_io;
 }
 
 /*
