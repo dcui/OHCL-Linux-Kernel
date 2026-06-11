@@ -68,6 +68,7 @@ enum pci_protocol_version_t {
 	PCI_PROTOCOL_VERSION_1_2 = PCI_MAKE_VERSION(1, 2),	/* RS1 */
 	PCI_PROTOCOL_VERSION_1_3 = PCI_MAKE_VERSION(1, 3),	/* Vibranium */
 	PCI_PROTOCOL_VERSION_1_4 = PCI_MAKE_VERSION(1, 4),	/* WS2022 */
+	PCI_PROTOCOL_VERSION_1_7 = PCI_MAKE_VERSION(1, 7),	/* For TDISP */
 };
 
 #define CPU_AFFINITY_ALL	-1ULL
@@ -77,6 +78,7 @@ enum pci_protocol_version_t {
  * first.
  */
 static enum pci_protocol_version_t pci_protocol_versions[] = {
+	PCI_PROTOCOL_VERSION_1_7,
 	PCI_PROTOCOL_VERSION_1_4,
 	PCI_PROTOCOL_VERSION_1_3,
 	PCI_PROTOCOL_VERSION_1_2,
@@ -136,6 +138,8 @@ enum pci_message_type {
 	PCI_BUS_RELATIONS2		= PCI_MESSAGE_BASE + 0x19,
 	PCI_RESOURCES_ASSIGNED3         = PCI_MESSAGE_BASE + 0x1A,
 	PCI_CREATE_INTERRUPT_MESSAGE3   = PCI_MESSAGE_BASE + 0x1B,
+	/* 0x1C, 0x1D: reserved for Windows, unused in Linux */
+	PCI_QUERY_ISOLATED_RESOURCES	= PCI_MESSAGE_BASE + 0x1E,
 	PCI_MESSAGE_MAXIMUM
 };
 
@@ -422,6 +426,53 @@ struct pci_delete_interrupt {
 	struct tran_int_desc int_desc;
 } __packed;
 
+
+/**
+ * enum hv_vpci_resource_isolation - Per-BAR/DMA isolation class.
+ *
+ * Returned by PCI_QUERY_ISOLATED_RESOURCES (protocol >= 1.7).
+ * For 64-bit BARs only the lower-half index carries a SHARED/PRIVATE
+ * classification; the upper-half index is always INVALID.
+ *
+ * @HV_VPCI_RESOURCE_ISOLATION_INVALID: No resource at this index.
+ *   A probed BAR marked INVALID must cause enumeration to fail.
+ * @HV_VPCI_RESOURCE_ISOLATION_SHARED:  Host-shared; apply VTOM translation.
+ * @HV_VPCI_RESOURCE_ISOLATION_PRIVATE: Guest-private; do NOT translate —
+ *   address stays in the private alias below VTOM.
+ */
+enum hv_vpci_resource_isolation {
+	HV_VPCI_RESOURCE_ISOLATION_INVALID = 0,
+	HV_VPCI_RESOURCE_ISOLATION_SHARED  = 1,
+	HV_VPCI_RESOURCE_ISOLATION_PRIVATE = 2,
+};
+
+/**
+ * struct pci_query_isolated_resources - VSC -> VSP request (8-byte payload).
+ *
+ * Sent once per child device during resource enumeration when the partition
+ * is hardware-isolated and the negotiated protocol is >= 1.7.
+ * The reply carries a per-BAR and per-DMA-path isolation classification so
+ * the VSC can decide whether to place each BAR above or below VTOM.
+ */
+struct pci_query_isolated_resources {
+	struct pci_message      message_type; /* PCI_QUERY_ISOLATED_RESOURCES */
+	union win_slot_encoding wslot;
+} __packed;
+
+/**
+ * struct pci_query_isolated_resources_response - VSP -> VSC reply (32-byte payload).
+ *
+ * @response:      Standard VMbus packet header + NTSTATUS.
+ * @bar_isolation: One &enum hv_vpci_resource_isolation value per BAR slot.
+ *                 For 64-bit BARs the upper-half index is always INVALID.
+ * @dma_isolation: Isolation class for the DMA path of this device.
+ */
+struct pci_query_isolated_resources_response {
+	struct pci_response response;                    /* hdr (16 B) + status (4 B) */
+	u32                 bar_isolation[PCI_STD_NUM_BARS]; /* 6 × 4 B = 24 B */
+	u32                 dma_isolation;               /* 4 B  — total payload = 32 B */
+} __packed;
+
 /*
  * Note: the VM must pass a valid block id, wslot and bytes_requested.
  */
@@ -497,9 +548,17 @@ struct hv_pcibus_device {
 	struct hv_device *hdev;
 	resource_size_t low_mmio_space;
 	resource_size_t high_mmio_space;
+	/**
+	 * @private_mmio_space: Total bytes required by BARs classified as
+	 * PRIVATE (protocol >= 1.7, hardware-isolated guest only).
+	 * These BARs must be placed below VTOM, in the private alias.
+	 */
+	resource_size_t private_mmio_space;
 	struct resource *mem_config;
 	struct resource *low_mmio_res;
 	struct resource *high_mmio_res;
+	/** @private_mmio_res: MMIO window allocated below VTOM for private BARs. */
+	struct resource *private_mmio_res;
 	struct completion *survey_event;
 	spinlock_t config_lock;	/* Avoid two threads writing index page */
 	spinlock_t device_list_lock;	/* Protect lists below */
@@ -539,6 +598,10 @@ struct hv_pcidev_description {
 	u32	ser;	/* serial number */
 	u32	flags;
 	u16	virtual_numa_node;
+
+	/* Isolation classification per BAR and DMA; filled by protocol >= 1.7. */
+	u32	bar_isolation[PCI_STD_NUM_BARS]; /* enum hv_vpci_resource_isolation */
+	u32	dma_isolation;                   /* enum hv_vpci_resource_isolation */
 };
 
 struct hv_dr_state {
@@ -1305,6 +1368,7 @@ static void _hv_pcifront_write_config(struct hv_pci_dev *hpdev, int where,
 		spin_lock_irqsave(&hbus->config_lock, flags);
 
 		if (hbus->use_calls) {
+			WARN_ON_ONCE(1);
 			phys_addr_t addr = hbus->mem_config->start + offset;
 
 			hv_pci_write_mmio(dev, hbus->mem_config->start, 4,
@@ -1996,6 +2060,7 @@ static void hv_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 		break;
 
 	case PCI_PROTOCOL_VERSION_1_4:
+	case PCI_PROTOCOL_VERSION_1_7:
 		size = hv_compose_msi_req_v3(&ctxt.int_pkts.v3,
 					cpu,
 					hpdev->desc.win_slot.slot,
@@ -2576,6 +2641,149 @@ static void q_resource_requirements(void *context, struct pci_response *resp,
 	complete(&completion->host_event);
 }
 
+
+
+
+/* ---- QueryIsolatedResources completion ---------------------------------- */
+
+struct hv_pci_isolated_res_compl {
+	struct hv_pci_compl comp_pkt;
+	u32 bar_isolation[PCI_STD_NUM_BARS];
+	u32 dma_isolation;
+};
+
+static void hv_pci_isolated_res_compl_func(void *context,
+					   struct pci_response *resp,
+					   int resp_packet_size)
+{
+	struct hv_pci_isolated_res_compl *comp = context;
+	struct pci_query_isolated_resources_response *r =
+		(struct pci_query_isolated_resources_response *)resp;
+
+	if (resp_packet_size < sizeof(*r)) {
+		comp->comp_pkt.completion_status = -1;
+		goto out;
+	}
+	comp->comp_pkt.completion_status = resp->status;
+	if (resp->status >= 0) {
+		memcpy(comp->bar_isolation, r->bar_isolation,
+		       sizeof(comp->bar_isolation));
+		comp->dma_isolation = r->dma_isolation;
+	}
+out:
+	complete(&comp->comp_pkt.host_event);
+}
+
+
+/**
+ * hv_pci_query_isolated_resources() - Ask the host to classify each BAR
+ * and the DMA path as SHARED, PRIVATE, or INVALID.
+ * @hpdev:	The child device being enumerated.
+ *
+ * Called once per device during resource enumeration, after the BAR sizes
+ * have been probed, and only when:
+ *  - the partition is hardware-isolated (SEV-SNP, TDX, ARM CCA), AND
+ *  - the negotiated vPCI protocol is >= 1.7.
+ *
+ * On protocol < 1.7 or on a non-isolated guest all BARs are preset to
+ * SHARED so the rest of the driver works unchanged.
+ *
+ * Return: 0 on success, -errno on failure.
+ */
+static int hv_pci_query_isolated_resources(struct hv_pci_dev *hpdev)
+{
+	struct hv_pcibus_device *hbus = hpdev->hbus;
+	struct hv_pci_isolated_res_compl comp;
+	struct {
+		struct pci_packet pkt;
+		u8 buffer[sizeof(struct pci_query_isolated_resources)];
+	} pkt;
+	struct pci_query_isolated_resources *req;
+	int i, ret;
+
+	/*
+	 * Non-isolated guest or host does not support protocol 1.7:
+	 * pre-fill SHARED so callers need no special-casing.
+	 * Per spec: "Resources will be considered Shared if it is an
+	 * isolated guest but vpci protocol did not negotiate high enough."
+	 */
+	if (!hv_is_isolation_supported() ||
+	    hbus->protocol_version < PCI_PROTOCOL_VERSION_1_7) {
+		for (i = 0; i < PCI_STD_NUM_BARS; i++)
+			hpdev->desc.bar_isolation[i] =
+				HV_VPCI_RESOURCE_ISOLATION_SHARED;
+		hpdev->desc.dma_isolation = HV_VPCI_RESOURCE_ISOLATION_SHARED;
+		return 0;
+	}
+
+	memset(&pkt, 0, sizeof(pkt));
+	memset(&comp, 0, sizeof(comp));
+	init_completion(&comp.comp_pkt.host_event);
+	pkt.pkt.completion_func = hv_pci_isolated_res_compl_func;
+	pkt.pkt.compl_ctxt = &comp;
+	req = (struct pci_query_isolated_resources *)pkt.buffer;
+	req->message_type.type = PCI_QUERY_ISOLATED_RESOURCES;
+	req->wslot.slot = hpdev->desc.win_slot.slot;
+
+	ret = vmbus_sendpacket(hbus->hdev->channel, req, sizeof(*req),
+			       (unsigned long)&pkt.pkt, VM_PKT_DATA_INBAND,
+			       VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED);
+	if (ret)
+		return ret;
+
+	ret = wait_for_response(hbus->hdev, &comp.comp_pkt.host_event);
+	if (ret)
+		return ret;
+
+	if (comp.comp_pkt.completion_status < 0) {
+		dev_err(&hbus->hdev->device,
+			"QueryIsolatedResources failed: %#x\n",
+			comp.comp_pkt.completion_status);
+		return -EPROTO;
+	}
+
+	/*
+	 * Validate: a probed (non-zero) BAR must not come back as INVALID.
+	 * For 64-bit BARs only the lower half (base index) is checked;
+	 * the upper-half index is expected to be INVALID per the wire spec.
+	 */
+	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+
+		printk("cdx: %s: line %d: i=%d, bar_val=0x%08x, bar_iso=0x%08x\n",
+		  __func__, __LINE__, i, hpdev->probed_bar[i], comp.bar_isolation[i]);
+#if 0
+		if (hpdev->probed_bar[i] != 0 &&
+		    comp.bar_isolation[i] == HV_VPCI_RESOURCE_ISOLATION_INVALID) {
+			dev_err(&hbus->hdev->device,
+				"BAR %d has resources but is marked INVALID\n",
+				i);
+			return -EPROTO;
+		}
+#endif
+	}
+
+	if (comp.dma_isolation == HV_VPCI_RESOURCE_ISOLATION_INVALID) {
+		dev_err(&hbus->hdev->device,
+			"DMA isolation is marked INVALID\n");
+		return -EPROTO;
+	}
+
+	memcpy(hpdev->desc.bar_isolation, comp.bar_isolation,
+	       sizeof(hpdev->desc.bar_isolation));
+	hpdev->desc.dma_isolation = comp.dma_isolation;
+
+	dev_info(&hbus->hdev->device,
+		"slot %#x isolation: BAR[%u/%u/%u/%u/%u/%u] DMA=%u\n",
+		hpdev->desc.win_slot.slot,
+		comp.bar_isolation[0], comp.bar_isolation[1],
+		comp.bar_isolation[2], comp.bar_isolation[3],
+		comp.bar_isolation[4], comp.bar_isolation[5],
+		comp.dma_isolation);
+
+	return 0;
+}
+
+
 /**
  * new_pcichild_device() - Create a new child device
  * @hbus:	The internal struct tracking this root PCI bus.
@@ -2629,6 +2837,26 @@ static struct hv_pci_dev *new_pcichild_device(struct hv_pcibus_device *hbus,
 	hpdev->desc = *desc;
 	refcount_set(&hpdev->refs, 1);
 	get_pcichild(hpdev);
+
+#if 0
+	/*
+	 * Query per-BAR and DMA isolation classifications.  This is a no-op
+	 * on non-isolated guests or when protocol < 1.7; in those cases the
+	 * helper pre-fills every entry with SHARED so the rest of the driver
+	 * requires no special-casing.
+	 */
+	printk("cdx: %s: line %d: calling hv_pci_query_isolated_resources\n", __func__, __LINE__);
+	ret = hv_pci_query_isolated_resources(hpdev);
+	printk("cdx: %s: line %d: calling hv_pci_query_isolated_resources: ret=%d\n", __func__, __LINE__, ret);
+	if (ret) {
+		dev_err(&hbus->hdev->device,
+			"Failed to query isolation for slot %#x: %d\n",
+			hpdev->desc.win_slot.slot, ret);
+		put_pcichild(hpdev);
+		goto error;
+	}
+#endif
+
 	spin_lock_irqsave(&hbus->device_list_lock, flags);
 
 	list_add_tail(&hpdev->list_entry, &hbus->children);
@@ -3855,6 +4083,20 @@ static int hv_pci_probe(struct hv_device *hdev,
 
 	prepopulate_bars(hbus);
 
+	{ /////////////////////////////////////////////////////////////////////////////////////
+		struct hv_pci_dev *hpdev;
+		//spin_lock_irqsave(&hbus->device_list_lock, flags);
+
+		list_for_each_entry(hpdev, &hbus->children, list_entry) {
+			printk("cdx: %s: line %d: calling hv_pci_query_isolated_resources\n", __func__, __LINE__);
+
+			ret = hv_pci_query_isolated_resources(hpdev);
+
+			if (ret)
+				goto free_windows;
+		}
+	} ////////////////////////////////////////////////////////////////////////////////////////////
+
 	hbus->state = hv_pcibus_probed;
 
 	ret = create_root_hv_pci_bus(hbus);
@@ -3862,6 +4104,27 @@ static int hv_pci_probe(struct hv_device *hdev,
 		goto free_windows;
 
 	mutex_unlock(&hbus->state_lock);
+
+
+	ssleep(3);
+
+	{
+		struct hv_pci_dev *hpdev;
+		struct pci_dev *pdev;
+		int wslot;
+
+		list_for_each_entry(hpdev, &hbus->children, list_entry) {
+			wslot = wslot_to_devfn(hpdev->desc.win_slot.slot);
+
+			pdev = pci_get_domain_bus_and_slot(hbus->bridge->domain_nr, 0, wslot);
+			 if (pdev) {
+				pdev->dev.use_priv_pages_for_io = true;
+				pci_dev_put(pdev);
+				printk("cdx: setting dev.use_priv_pages_for_io: dev=%px\n", &pdev->dev);
+			}
+		}
+	}
+
 	return 0;
 
 free_windows:

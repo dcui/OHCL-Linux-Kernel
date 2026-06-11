@@ -851,6 +851,21 @@ static bool hv_is_private_mmio(u64 addr)
 	    addr < (VTPM_BASE_ADDRESS + PAGE_SIZE))
 		return true;
 
+	//add an API for hv_pci to add/remove a private MMIO range.
+	if (addr == 0xfe0000000) {
+		printk("cdx: hv_is_private_mmio: BAR1 is private\n");
+		return true;
+	}
+
+	if (addr == 0xfe0001000) {
+		printk("cdx: hv_is_private_mmio: BAR2 is private\n");
+		return true;
+	}
+
+	if (addr == 0xfe0002000) {
+		printk("cdx: hv_is_private_mmio: BAR3 is shared!!!\n");
+		return false;
+	}
 	return false;
 }
 
