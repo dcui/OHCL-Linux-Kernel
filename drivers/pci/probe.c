@@ -2621,6 +2621,7 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 		return NULL;
 	}
 
+	dev->dev.use_priv_pages_for_io = true;
 	return dev;
 }
 
